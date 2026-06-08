@@ -7,3 +7,4 @@ pandas
 psycopg2-binary
 redis==5.0.3
 python-decouple==3.8
+python-binance
