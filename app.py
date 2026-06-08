@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# ملف app.py - نسخة فريم الـ 4 ساعات (استراتيجيات عالية الاحتمالية) مجهزة لـ Render و n8n
+# ملف app.py - نسخة فريم الـ 4 ساعات (استراتيجيات عالية الاحتمالية) مجهزة لـ Render و n8n مع قراءة ديناميكية للعملات
 
 import time
 import os
@@ -32,7 +32,6 @@ N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 PORT = int(os.getenv("PORT", 5000))
 
 # إعدادات فريم الـ 4 ساعات
-# تم استبدال الكلاس لتجنب أخطاء AttributeError تماماً عبر كتابتها مباشرة
 TIMEFRAME = "4h"  
 LOOKBACK_DAYS = "90 day ago UTC"  # نحتاج 90 يوماً لجمع شموع كافية لفريم 4 ساعات (حوالي 540 شمعة)
 
@@ -44,8 +43,49 @@ IS_TRADING_ENABLED = True
 signal_cache_lock = Lock()
 trading_status_lock = Lock()
 
-# قائمة العملات القوية والمناسبة لفريم 4 ساعات
-VALID_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "LINKUSDT", "AVAXUSDT"]
+# اسم الملف النصي الذي يحتوي على قائمة العملات المراقبة
+SYMBOLS_FILE_NAME = "crypto_list.txt"
+
+# --- دالة قراءة العملات من الملف النصي وتنسيقها تلقائياً ---
+def load_symbols_from_file(filename=SYMBOLS_FILE_NAME) -> list:
+    """قراءة رموز العملات من ملف نصي وتنسيقها لتنتهي بـ USDT تلقائياً"""
+    default_symbols = ["BTC", "ETH", "SOL", "BNB", "LINK", "AVAX"]
+    
+    # إذا لم يكن الملف موجوداً، نقوم بإنشائه تلقائياً بالعملات الافتراضية كحماية للسيرفر
+    if not os.path.exists(filename):
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                for sym in default_symbols:
+                    f.write(f"{sym}\n")
+            logger.info(f"📝 Created default '{filename}' file with baseline symbols.")
+        except Exception as e:
+            logger.error(f"❌ Failed to create default symbols file: {e}")
+            return [f"{s}USDT" for s in default_symbols]
+
+    symbols = []
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip().upper()
+                # تجاهل السطور الفارغة أو السطور المخصصة للتعليقات
+                if not line or line.startswith("#") or line.startswith("//"):
+                    continue
+                
+                # تنسيق الرمز تلقائياً لإضافة زوج USDT إذا لم يكن مكتوباً
+                if not line.endswith("USDT"):
+                    formatted_symbol = f"{line}USDT"
+                else:
+                    formatted_symbol = line
+                
+                symbols.append(formatted_symbol)
+                
+        # إزالة التكرار إن وجد مع الحفاظ على الترتيب
+        symbols = list(dict.fromkeys(symbols))
+        logger.info(f"✅ Active monitored symbols dynamically reloaded: {symbols}")
+        return symbols
+    except Exception as e:
+        logger.error(f"❌ Error reading '{filename}': {e}. Using baseline fallback.")
+        return [f"{s}USDT" for s in default_symbols]
 
 # --- دالة إرسال التنبيهات الفورية إلى n8n ---
 def send_alert_to_n8n(event_type, data):
@@ -185,7 +225,6 @@ def execute_4h_trade(symbol: str, entry_price: float, direction: str, atr: float
     """ إدارة المخاطر لفريم 4 ساعات (أهداف بعيدة ووقف خسارة منطقي) """
     
     # في فريم 4 ساعات، نستخدم ATR * 2 لوقف الخسارة لتجنب ضرب الوقف بسبب الذبذبات
-    # الهدف الأول 1:1.5 ، والهدف الثاني 1:3 لتحقيق عوائد مجزية
     if direction == "BUY":
         stop_loss = entry_price - (atr * 2.0)
         target_1 = entry_price + (atr * 3.0)
@@ -222,7 +261,6 @@ def execute_4h_trade(symbol: str, entry_price: float, direction: str, atr: float
 
 def main_bot_loop():
     """ محرك الفحص الرئيسي، يشتغل كل فترة للبحث عن صفقات جديدة """
-    # تهيئة اتصال Binance كـ Read-only في حال عدم وجود مفاتيح (يكفي لجلب الشموع التاريخية)
     try:
         client = Client(os.getenv("BINANCE_API_KEY", ""), os.getenv("BINANCE_API_SECRET", ""))
     except Exception as e:
@@ -234,8 +272,11 @@ def main_bot_loop():
             enabled = IS_TRADING_ENABLED
         
         if enabled:
-            logger.info(f"⏳ [Engine] Scanning 4H Charts for High-Probability setups...")
-            for symbol in VALID_SYMBOLS:
+            # إعادة تحميل قائمة العملات ديناميكياً من الملف في بداية كل دورة فحص
+            current_symbols = load_symbols_from_file()
+            
+            logger.info(f"⏳ [Engine] Scanning 4H Charts for {len(current_symbols)} active symbols...")
+            for symbol in current_symbols:
                 try:
                     # جلب البيانات لآخر 90 يوم على فريم 4 ساعات
                     klines = client.get_historical_klines(symbol, TIMEFRAME, LOOKBACK_DAYS)
@@ -259,7 +300,7 @@ def main_bot_loop():
                 except Exception as e:
                     logger.error(f"❌ [Engine Error] Failed to scan {symbol}: {e}")
                     
-        # في فريم 4 ساعات، فحص كل 15 دقيقة ممتاز وموفر لموارد المعالج
+        # فحص دوري كل 15 دقيقة
         time.sleep(60 * 15)
 
 # =====================================================================
@@ -270,12 +311,13 @@ def main_bot_loop():
 @require_api_key
 def get_bot_status():
     """ واجهة فحص حالة البوت لـ n8n """
+    current_symbols = load_symbols_from_file()
     with trading_status_lock:
         status = {
             "is_running": IS_TRADING_ENABLED,
             "timeframe": "4 Hours",
             "active_signals": len(open_signals_cache),
-            "monitored_symbols": VALID_SYMBOLS
+            "monitored_symbols": current_symbols
         }
     return jsonify({"status": "success", "data": status}), 200
 
@@ -370,11 +412,12 @@ DASHBOARD_HTML = """
 @app.route('/', methods=['GET'])
 def index():
     """ لوحة القيادة البسيطة للمتصفح """
+    current_symbols = load_symbols_from_file()
     with trading_status_lock:
         status = {
             "is_running": IS_TRADING_ENABLED,
             "active_signals": len(open_signals_cache),
-            "monitored_symbols": VALID_SYMBOLS
+            "monitored_symbols": current_symbols
         }
     return render_template_string(DASHBOARD_HTML, status=status)
 
