@@ -1,5 +1,6 @@
+```python
 # -*- coding: utf-8 -*-
-# ملف app.py - نسخة V34.3.0 المجهزة لمنصة Render والربط مع n8n
+# ملف app.py - نسخة فريم الـ 4 ساعات (استراتيجيات عالية الاحتمالية) مجهزة لـ Render و n8n
 
 import time
 import os
@@ -9,22 +10,11 @@ import requests
 import secrets
 import numpy as np
 import pandas as pd
-import psycopg2
-import redis
-import statistics
-import random
-from decimal import Decimal, ROUND_DOWN, getcontext
-from psycopg2 import sql, OperationalError, InterfaceError
-from psycopg2.extras import RealDictCursor
-from binance.client import Client
-from binance import ThreadedWebsocketManager
-from binance.exceptions import BinanceAPIException
+from datetime import datetime, timezone
+from threading import Thread, Lock
 from flask import Flask, jsonify, render_template_string, request
 from flask_cors import CORS
-from threading import Thread, Lock
-from datetime import datetime, timezone, timedelta
-from decouple import config
-from typing import List, Dict, Optional, Any, Set
+from binance.client import Client
 
 # --- إعداد نظام التسجيل (Logging) ---
 logging.basicConfig(
@@ -32,64 +22,50 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger('CryptoBotV34_Render')
+logger = logging.getLogger('CryptoBot_4H_Pro')
 
 # --- تهيئة تطبيق Flask وعقد الأمان مع n8n ---
 app = Flask(__name__)
 CORS(app)
 
-# جلب المتغيرات البيئية أو توليد قيم تلقائية آمنة
 BOT_API_KEY = os.getenv("BOT_API_KEY", secrets.token_hex(16))
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 PORT = int(os.getenv("PORT", 5000))
 
+# إعدادات فريم الـ 4 ساعات
+TIMEFRAME = Client.KINTERVAL_4HOUR
+LOOKBACK_DAYS = "90 day ago UTC" # نحتاج 90 يوماً لجمع شموع كافية لفريم 4 ساعات (حوالي 540 شمعة)
+
 print(f"🔑 Your BOT_API_KEY for n8n configuration is: {BOT_API_KEY}")
 
-# --- المتغيرات المشتركة والـ Locks لحماية البيانات (Thread-Safety) ---
-live_prices = {}
+# --- المتغيرات المشتركة والـ Locks لحماية البيانات ---
 open_signals_cache = {}
-validated_symbols_to_scan = set()
 IS_TRADING_ENABLED = True
-usdt_balance = 1000.0
-
-live_prices_lock = Lock()
 signal_cache_lock = Lock()
 trading_status_lock = Lock()
-balance_lock = Lock()
 
-# محاكاة بسيطة لقواعد البيانات لتأمين عمل الكود البرمجي على سيرفر Render فوراً
-def check_db_connection(): return True
-def init_db(): logger.info("✅ [Database] Initialized (Render Fallback Mode)")
-def init_redis(): logger.info("✅ [Redis] Initialized (Render Fallback Mode)")
-def load_open_signals_to_cache(): pass
-def load_notifications_to_cache(): pass
-def load_settings_from_redis(): pass
-def update_balance(): pass
-def get_exchange_info_map(): pass
-def get_validated_symbols(): return {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"}
+# قائمة العملات القوية والمناسبة لفريم 4 ساعات
+VALID_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "LINKUSDT", "AVAXUSDT"]
 
 # --- دالة إرسال التنبيهات الفورية إلى n8n ---
 def send_alert_to_n8n(event_type, data):
-    """ تقوم بإرسال تحديثات الصفقات اللحظية إلى منصة n8n لمعالجتها بالذكاء الاصطناعي """
+    """ إرسال بيانات الصفقات والإشارات إلى n8n لمعالجتها بالذكاء الاصطناعي """
     if not N8N_WEBHOOK_URL:
-        logger.warning("[n8n] Webhook URL not configured. Skipping alert.")
         return False
     
     payload = {
         "event": event_type,
-        "bot_version": "V34.3.0",
+        "bot_version": "4H_Pro_V1",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "data": data
     }
     try:
         response = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=5)
         if response.status_code == 200:
-            logger.info(f"🔔 [n8n] Alert sent successfully for event: {event_type}")
+            logger.info(f"🔔 [n8n] Alert sent successfully: {event_type}")
             return True
-        else:
-            logger.error(f"❌ [n8n] Failed to send alert. Status code: {response.status_code}")
     except Exception as e:
-        logger.error(f"❌ [n8n] Connection error while reaching n8n: {e}")
+        logger.error(f"❌ [n8n] Connection error: {e}")
     return False
 
 # --- جدار الحماية (Middleware) لطلبات n8n ---
@@ -97,202 +73,292 @@ def require_api_key(f):
     def decorated(*args, **kwargs):
         api_key = request.headers.get("X-Bot-API-Key") or request.args.get("api_key")
         if not api_key or api_key != BOT_API_KEY:
-            return jsonify({"status": "error", "message": "Unauthorized access. Invalid API Key."}), 401
+            return jsonify({"status": "error", "message": "Unauthorized access."}), 401
         return f(*args, **kwargs)
     decorated.__name__ = f.__name__
     return decorated
 
-# --- محاكاة مؤشرات واستراتيجيات البوت لضمان استقرار التشغيل السحابي ---
-def calculate_dynamic_position_size(symbol, price, direction):
-    # حسابات تقريبية سريعة لحجم الصفقة والمستهدفات
-    position_size = 50.0 # 50 USDT
-    stop_loss = price * 0.98 if direction == "BUY" else price * 1.02
-    target_1 = price * 1.01 if direction == "BUY" else price * 0.99
-    target_2 = price * 1.03 if direction == "BUY" else price * 0.97
-    return position_size, stop_loss, target_1, target_2
+# =====================================================================
+# محرك التحليل الفني والاستراتيجيات لفريم 4 ساعات (High Probability)
+# =====================================================================
 
-# --- دالة إعادة التحليل الدورية وإدارة الصفقات (كل 5 دقائق) ---
-def re_analyze_open_trades():
-    """ تُستدعى دورياً لإعادة تحليل الصفقات المفتوحة وإرسال تقارير الزخم لـ n8n """
-    logger.info("[Re-Analysis] Executing 5-minute trade re-evaluation loop...")
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """ حساب المؤشرات الفنية الثقيلة لفريم 4 ساعات """
+    if len(df) < 200:
+        return df
+
+    # المتوسطات المتحركة لتحديد الاتجاه العام
+    df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
+    df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
+
+    # مؤشر RSI (الزخم)
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / (loss + 1e-10)
+    df['rsi_14'] = 100 - (100 / (1 + rs))
+
+    # مؤشر MACD
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = exp1 - exp2
+    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = df['macd'] - df['macd_signal']
+
+    # بولينجر باندز (للانعكاسات)
+    df['bb_middle'] = df['close'].rolling(window=20).mean()
+    df['bb_std'] = df['close'].rolling(window=20).std()
+    df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2.5) # 2.5 لالتقاط الانحرافات الشديدة فقط
+    df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * 2.5)
+
+    # مؤشر ATR (متوسط المدى الحقيقي) لحساب المخاطرة والأهداف
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['atr_14'] = true_range.ewm(alpha=1/14, adjust=False).mean()
+    
+    # متوسط حجم التداول لـ 20 شمعة (لتأكيد الاختراقات)
+    df['vol_ma_20'] = df['volume'].rolling(window=20).mean()
+
+    return df
+
+def check_strategies_4h(symbol: str, df: pd.DataFrame):
+    """ فحص 3 استراتيجيات عالية الاحتمالية وتوليد التوصيات """
+    if df.empty or 'atr_14' not in df.columns:
+        return
+
+    # نأخذ آخر شمعة مكتملة تماماً (قبل الأخيرة) لضمان ثبات المؤشرات
+    last = df.iloc[-2]
+    prev = df.iloc[-3]
+    
+    close_price = float(last['close'])
+    atr = float(last['atr_14'])
+    strategy_triggered = None
+    direction = None
+
+    # التحقق من عدم وجود صفقة مفتوحة لنفس العملة
     with signal_cache_lock:
-        current_open_trades = list(open_signals_cache.values())
+        if symbol in open_signals_cache:
+            return
 
-    for trade in current_open_trades:
-        symbol = trade['symbol']
-        with live_prices_lock:
-            current_price = live_prices.get(symbol)
-        if not current_price: continue
+    # --- استراتيجية 1: التوافق الذهبي (Golden Confluence) ---
+    # الشروط: اتجاه صاعد قوي (EMA50 > EMA200)، السعر يصحح ويلمس EMA21، وتقاطع الماكد إيجابي
+    uptrend_strong = last['ema_50'] > last['ema_200']
+    pullback_to_ema21 = last['low'] <= last['ema_21'] and close_price > last['ema_21']
+    macd_bullish_cross = last['macd'] > last['macd_signal'] and prev['macd'] <= prev['macd_signal']
+    rsi_healthy = 45 < last['rsi_14'] < 65
 
-        # محاكاة رصد ضعف الزخم أو قوته للتكامل مع n8n
-        simulated_rsi = random.randint(35, 75)
-        if simulated_rsi < 40:
-            logger.info(f"⚠️ [{symbol}] Early exit triggered via Re-Analysis due to weak momentum.")
-            send_alert_to_n8n("TRADE_CLOSED", {"symbol": symbol, "reason": "Early Exit - Weak RSI", "price": current_price})
-            with signal_cache_lock: open_signals_cache.pop(symbol, None)
-        elif simulated_rsi > 70:
-            new_target_2 = trade['target_2'] * 1.02
-            logger.info(f"🚀 [{symbol}] Extraordinary strength! Target 2 raised to {new_target_2:.4f}")
-            send_alert_to_n8n("TARGET_RAISED", {"symbol": symbol, "new_target_2": new_target_2, "current_price": current_price})
+    if uptrend_strong and pullback_to_ema21 and macd_bullish_cross and rsi_healthy:
+        strategy_triggered = "Golden Confluence (Trend Continuation)"
+        direction = "BUY"
 
-# --- محركات الخلفية المستمرة للـ Loops البوت ---
+    # --- استراتيجية 2: الانعكاس العنيف (Extreme Mean Reversion) ---
+    # الشروط: السعر يكسر الحد السفلي لبولينجر بقوة، مع RSI تحت 25 (تشبع بيعي حاد جداً)
+    pierced_lower_bb = last['close'] < last['bb_lower']
+    extreme_oversold = last['rsi_14'] < 25
+    reversal_candle = last['close'] > last['open'] # شمعة خضراء أغلقت إيجابية
+
+    if pierced_lower_bb and extreme_oversold and reversal_candle:
+        strategy_triggered = "Extreme Mean Reversion (Oversold Bounce)"
+        direction = "BUY"
+
+    # --- استراتيجية 3: اختراق السيولة المدعوم بالحجم (Volume Breakout) ---
+    # الشروط: السعر يخترق مقاومة EMA50 بحجم تداول أعلى من المتوسط بـ 200% وزخم قوي
+    price_breakout = prev['close'] < prev['ema_50'] and close_price > last['ema_50']
+    massive_volume = last['volume'] > (last['vol_ma_20'] * 2.0)
+    strong_momentum = last['rsi_14'] > 60
+
+    if price_breakout and massive_volume and strong_momentum:
+        strategy_triggered = "Liquidity Volume Breakout"
+        direction = "BUY"
+
+    # في حال تحقق إحدى الاستراتيجيات، نقوم بفتح التوصية
+    if strategy_triggered and direction:
+        execute_4h_trade(symbol, close_price, direction, atr, strategy_triggered)
+
+def execute_4h_trade(symbol: str, entry_price: float, direction: str, atr: float, strategy_name: str):
+    """ إدارة المخاطر لفريم 4 ساعات (أهداف بعيدة ووقف خسارة منطقي) """
+    
+    # في فريم 4 ساعات، نستخدم ATR * 2 لوقف الخسارة لتجنب ضرب الوقف بسبب الذبذبات
+    # الهدف الأول 1:1.5 ، والهدف الثاني 1:3 لتحقيق عوائد مجزية
+    if direction == "BUY":
+        stop_loss = entry_price - (atr * 2.0)
+        target_1 = entry_price + (atr * 3.0)
+        target_2 = entry_price + (atr * 6.0)
+    else:
+        stop_loss = entry_price + (atr * 2.0)
+        target_1 = entry_price - (atr * 3.0)
+        target_2 = entry_price - (atr * 6.0)
+
+    trade_signal = {
+        "symbol": symbol,
+        "direction": direction,
+        "strategy": strategy_name,
+        "entry_price": round(entry_price, 4),
+        "stop_loss": round(stop_loss, 4),
+        "target_1": round(target_1, 4),
+        "target_2": round(target_2, 4),
+        "risk_reward_ratio": "1:3",
+        "time": datetime.now(timezone.utc).isoformat()
+    }
+
+    with signal_cache_lock:
+        open_signals_cache[symbol] = trade_signal
+
+    logger.info(f"🎯 [4H SIGNAL] {direction} | {symbol} | Strategy: {strategy_name}")
+    
+    # إرسال التوصية إلى n8n
+    send_alert_to_n8n("NEW_4H_SIGNAL", trade_signal)
+
+
+# =====================================================================
+# المحركات الخلفية (Background Loops)
+# =====================================================================
+
 def main_bot_loop():
+    """ محرك الفحص الرئيسي، يشتغل كل فترة للبحث عن صفقات جديدة """
+    # تهيئة اتصال Binance كـ Read-only في حال عدم وجود مفاتيح (يكفي لجلب الشموع)
+    try:
+        client = Client(os.getenv("BINANCE_API_KEY", ""), os.getenv("BINANCE_API_SECRET", ""))
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Binance client: {e}")
+        return
+
     while True:
         with trading_status_lock:
             enabled = IS_TRADING_ENABLED
+        
         if enabled:
-            logger.info("[Engine] Scanning markets for new Scalping signals...")
-            # منطق الفحص وتوليد الإشارات يوضع هنا
-        time.sleep(60 * 5) # فحص كل 5 دقائق لمواكبة الشموع
+            logger.info(f"⏳ [Engine] Scanning 4H Charts for High-Probability setups...")
+            for symbol in VALID_SYMBOLS:
+                try:
+                    # جلب البيانات لآخر 90 يوم على فريم 4 ساعات
+                    klines = client.get_historical_klines(symbol, TIMEFRAME, LOOKBACK_DAYS)
+                    if not klines or len(klines) < 200:
+                        continue
+                    
+                    df = pd.DataFrame(klines, columns=[
+                        'time', 'open', 'high', 'low', 'close', 'volume', 
+                        'close_time', 'qav', 'num_trades', 'taker_base', 'taker_quote', 'ignore'
+                    ])
+                    # تنظيف البيانات
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        df[col] = df[col].astype(float)
+                    
+                    # معالجة وتحليل
+                    df = calculate_indicators(df)
+                    check_strategies_4h(symbol, df)
+                    
+                    time.sleep(1) # حماية من حظر الـ API Rate Limit
+                    
+                except Exception as e:
+                    logger.error(f"❌ [Engine Error] Failed to scan {symbol}: {e}")
+                    
+        # في فريم 4 ساعات، الشموع تتغير ببطء. فحص كل 15 دقيقة أكثر من كافٍ.
+        time.sleep(60 * 15)
 
-def trade_management_loop():
-    while True:
-        re_analyze_open_trades()
-        time.sleep(60 * 5)
-
-# --- محاكاة تحديث أسعار الـ WebSocket لـ Binance وحمايتها من تضخم الذاكرة ---
-def fake_websocket_price_feeder():
-    global live_prices
-    symbols = get_validated_symbols()
-    while True:
-        with live_prices_lock:
-            for sym in symbols:
-                base_price = 65000.0 if "BTC" in sym else (3500.0 if "ETH" in sym else 140.0)
-                live_prices[sym] = base_price + random.uniform(-10, 10)
-        time.sleep(1)
-
-# --- قنوات الـ API لربط التحكم والأتمتة مع n8n ---
+# =====================================================================
+# واجهات الـ API ولوحة التحكم (Dashboard)
+# =====================================================================
 
 @app.route('/api/v1/status', methods=['GET'])
 @require_api_key
 def get_bot_status():
-    """ يتيح لـ n8n ولعقدة الـ Keep-Alive التأكد من أن البوت يعمل وبكامل طاقته """
+    """ واجهة فحص حالة البوت لـ n8n """
     with trading_status_lock:
         status = {
             "is_running": IS_TRADING_ENABLED,
-            "open_trades_count": len(open_signals_cache),
-            "live_prices_tracked": len(live_prices),
-            "monitored_symbols": list(get_validated_symbols()),
-            "server_time": datetime.now(timezone.utc).isoformat()
+            "timeframe": "4 Hours",
+            "active_signals": len(open_signals_cache),
+            "monitored_symbols": VALID_SYMBOLS
         }
     return jsonify({"status": "success", "data": status}), 200
 
 @app.route('/api/v1/control', methods=['POST'])
 @require_api_key
 def control_bot():
-    """ يسمح لـ n8n بتعطيل البوت مؤقتاً عند تقلبات السوق أو تشغيله مجدداً """
+    """ واجهة تشغيل وإيقاف البوت من n8n """
     global IS_TRADING_ENABLED
     data = request.get_json() or {}
     action = data.get("action")
     
     with trading_status_lock:
-        if action == "start":
-            IS_TRADING_ENABLED = True
-        elif action == "stop":
-            IS_TRADING_ENABLED = False
-        else:
-            return jsonify({"status": "error", "message": "Invalid action. Use 'start' or 'stop'."}), 400
+        if action == "start": IS_TRADING_ENABLED = True
+        elif action == "stop": IS_TRADING_ENABLED = False
+        else: return jsonify({"error": "Invalid action"}), 400
             
     return jsonify({"status": "success", "is_running": IS_TRADING_ENABLED}), 200
 
-@app.route('/api/v1/external-trigger', methods=['POST'])
-@require_api_key
-def external_trigger():
-    """ يسمح لـ n8n بتمرير توصية فنية خارجية للبوت ليقوم بحساب أحجام المخاطر وفتحها فوراً """
-    data = request.get_json() or {}
-    symbol = data.get("symbol")
-    direction = data.get("direction")
-    
-    if not symbol or not direction:
-        return jsonify({"status": "error", "message": "Missing symbol or direction"}), 400
-        
-    with live_prices_lock:
-        current_price = live_prices.get(symbol)
-        
-    if not current_price:
-        return jsonify({"status": "error", "message": f"Live price for {symbol} is currently unavailable."}), 422
-
-    pos_size, sl, tg1, tg2 = calculate_dynamic_position_size(symbol, current_price, direction)
-    
-    trade_signal = {
-        "symbol": symbol,
-        "direction": direction,
-        "entry_price": current_price,
-        "position_size": pos_size,
-        "stop_loss": sl,
-        "target_1": tg1,
-        "target_2": tg2,
-        "source": "n8n_hybrid_ai"
-    }
-    
-    with signal_cache_lock:
-        open_signals_cache[symbol] = trade_signal
-
-    # إرسال تنبيه تأكيدي فوري للـ n8n بأنه تم فتح الصفقة المطلوبة
-    send_alert_to_n8n("TRADE_OPENED", trade_signal)
-    
-    return jsonify({"status": "success", "message": "Signal executed successfully", "data": trade_signal}), 200
-
-# --- واجهة الـ Dashboard الرسومية المصلحة والمكتملة بالكامل ---
-SETTINGS_TEMPLATE = """
+DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8">
-    <title>CryptoBot Control Panel</title>
+    <title>4H Pro Trading Bot</title>
     <style>
-        body { font-family: Arial, sans-serif; background: #0f172a; color: #fff; padding: 40px; text-align: center; }
-        .card { background: #1e293b; border-radius: 8px; padding: 20px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
-        .status { font-size: 24px; color: #38bdf8; margin-bottom: 20px; }
-        .btn { background: #0284c7; border: none; padding: 10px 20px; color: white; border-radius: 4px; cursor: pointer; font-size: 16px; }
-        .btn:hover { background: #0369a1; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0b1120; color: #f8fafc; padding: 40px; text-align: center; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .card { background: #1e293b; border-radius: 12px; padding: 30px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.3); border: 1px solid #334155; }
+        h1 { color: #38bdf8; margin-top: 0; }
+        .badge { background: #059669; color: white; padding: 5px 15px; border-radius: 20px; font-weight: bold; font-size: 14px;}
+        .badge.stopped { background: #e11d48; }
+        .stats { display: flex; justify-content: space-around; margin: 30px 0; padding: 20px; background: #0f172a; border-radius: 8px; }
+        .stat-item { font-size: 18px; }
+        .stat-value { font-size: 28px; font-weight: bold; color: #fbbf24; display: block; margin-top: 10px; }
     </style>
 </head>
 <body>
-    <div class="card">
-        <h1>لوحة تحكم بوت التداول V34.3.0</h1>
-        <div class="status">الحالة الحالية للبوت: {{ 'نشط ويعمل' if status.is_running else 'متوقف مؤقتاً' }}</div>
-        <p>عدد العملات المراقبة حالياً: {{ status.live_prices_tracked }}</p>
-        <p>الصفقات المفتوحة: {{ status.open_trades_count }}</p>
-        <form action="/api/v1/control?api_key={{ key }}" method="POST" style="display:inline;">
-            <input type="hidden" name="action" value="{{ 'stop' if status.is_running else 'start' }}">
-            <button class="btn" type="button" onclick="toggleBot()">تغيير حالة التشغيل</button>
-        </form>
+    <div class="container">
+        <div class="card">
+            <h1>روبوت التداول الاحترافي (فريم 4 ساعات) 📈</h1>
+            <p>يستخدم استراتيجيات عالية الاحتمالية مبنية على السيولة والزخم المؤسسي.</p>
+            
+            <div style="margin: 20px 0;">
+                <span class="badge {{ '' if status.is_running else 'stopped' }}">
+                    الحالة: {{ 'يعمل ويبحث عن صفقات' if status.is_running else 'متوقف مؤقتاً' }}
+                </span>
+            </div>
+
+            <div class="stats">
+                <div class="stat-item">
+                    الإطار الزمني
+                    <span class="stat-value">4 ساعات</span>
+                </div>
+                <div class="stat-item">
+                    التوصيات النشطة
+                    <span class="stat-value">{{ status.active_signals }}</span>
+                </div>
+                <div class="stat-item">
+                    العملات المراقبة
+                    <span class="stat-value">{{ status.monitored_symbols|length }}</span>
+                </div>
+            </div>
+            
+            <p style="color: #94a3b8; font-size: 14px;">تم دمج البوت بالكامل مع n8n ويعمل بنظام Webhooks.</p>
+        </div>
     </div>
-    <script>
-        function toggleBot() {
-            const action = "{{ 'stop' if status.is_running else 'start' }}";
-            fetch('/api/v1/control?api_key={{ key }}', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: action })
-            }).then(() => window.location.reload());
-        }
-    </script>
 </body>
 </html>
 """
 
 @app.route('/', methods=['GET'])
 def index():
-    """ عرض لوحة التحكم الرسومية المباشرة """
+    """ لوحة القيادة البسيطة للمتصفح """
     with trading_status_lock:
         status = {
             "is_running": IS_TRADING_ENABLED,
-            "open_trades_count": len(open_signals_cache),
-            "live_prices_tracked": len(live_prices)
+            "active_signals": len(open_signals_cache),
+            "monitored_symbols": VALID_SYMBOLS
         }
-    return render_template_string(SETTINGS_TEMPLATE, status=status, key=BOT_API_KEY)
+    return render_template_string(DASHBOARD_HTML, status=status)
 
-# --- معالج بدء الخيوط وتشغيل التطبيق ---
 if __name__ == '__main__':
-    init_db()
-    init_redis()
-    
-    # تشغيل الخيوط الخلفية في بيئة معزولة لمنع قفل الـ Request
-    Thread(target=fake_websocket_price_feeder, daemon=True).start()
+    # تشغيل محرك الفحص في الخلفية
     Thread(target=main_bot_loop, daemon=True).start()
-    Thread(target=trade_management_loop, daemon=True).start()
     
-    logger.info(f"🚀 Starting Production Server on Port {PORT}...")
+    logger.info(f"🚀 Starting 4H Pro Bot on Port {PORT}...")
     app.run(host='0.0.0.0', port=PORT)
+
+```
