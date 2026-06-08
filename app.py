@@ -32,7 +32,8 @@ N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 PORT = int(os.getenv("PORT", 5000))
 
 # إعدادات فريم الـ 4 ساعات
-TIMEFRAME = Client.KINTERVAL_4HOUR
+# تم استبدال الكلاس لتجنب أخطاء AttributeError تماماً عبر كتابتها مباشرة
+TIMEFRAME = "4h"  
 LOOKBACK_DAYS = "90 day ago UTC"  # نحتاج 90 يوماً لجمع شموع كافية لفريم 4 ساعات (حوالي 540 شمعة)
 
 print(f"🔑 Your BOT_API_KEY for n8n configuration is: {BOT_API_KEY}")
@@ -382,4 +383,6 @@ if __name__ == '__main__':
     Thread(target=main_bot_loop, daemon=True).start()
     
     logger.info(f"🚀 Starting 4H Pro Bot on Port {PORT}...")
-    app.run(host='0.0.0.0', port=PORT) 
+    app.run(host='0.0.0.0', port=PORT)
+
+```
