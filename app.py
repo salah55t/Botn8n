@@ -1,4 +1,3 @@
-```python
 # -*- coding: utf-8 -*-
 # ملف app.py - نسخة فريم الـ 4 ساعات (استراتيجيات عالية الاحتمالية) مجهزة لـ Render و n8n
 
@@ -28,13 +27,13 @@ logger = logging.getLogger('CryptoBot_4H_Pro')
 app = Flask(__name__)
 CORS(app)
 
-BOT_API_KEY = os.getenv("BOT_API_KEY", secrets.token_hex(16))
+BOT_API_KEY = os.getenv("BOT_API_KEY", "2009Hamza@")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 PORT = int(os.getenv("PORT", 5000))
 
 # إعدادات فريم الـ 4 ساعات
 TIMEFRAME = Client.KINTERVAL_4HOUR
-LOOKBACK_DAYS = "90 day ago UTC" # نحتاج 90 يوماً لجمع شموع كافية لفريم 4 ساعات (حوالي 540 شمعة)
+LOOKBACK_DAYS = "90 day ago UTC"  # نحتاج 90 يوماً لجمع شموع كافية لفريم 4 ساعات (حوالي 540 شمعة)
 
 print(f"🔑 Your BOT_API_KEY for n8n configuration is: {BOT_API_KEY}")
 
@@ -51,6 +50,7 @@ VALID_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "LINKUSDT", "AVAXUS
 def send_alert_to_n8n(event_type, data):
     """ إرسال بيانات الصفقات والإشارات إلى n8n لمعالجتها بالذكاء الاصطناعي """
     if not N8N_WEBHOOK_URL:
+        logger.warning("[n8n] Webhook URL is not configured. Alert skipped.")
         return False
     
     payload = {
@@ -64,8 +64,10 @@ def send_alert_to_n8n(event_type, data):
         if response.status_code == 200:
             logger.info(f"🔔 [n8n] Alert sent successfully: {event_type}")
             return True
+        else:
+            logger.error(f"❌ [n8n] Failed to send alert. Status code: {response.status_code}")
     except Exception as e:
-        logger.error(f"❌ [n8n] Connection error: {e}")
+        logger.error(f"❌ [n8n] Connection error to n8n Webhook: {e}")
     return False
 
 # --- جدار الحماية (Middleware) لطلبات n8n ---
@@ -109,7 +111,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # بولينجر باندز (للانعكاسات)
     df['bb_middle'] = df['close'].rolling(window=20).mean()
     df['bb_std'] = df['close'].rolling(window=20).std()
-    df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2.5) # 2.5 لالتقاط الانحرافات الشديدة فقط
+    df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2.5)  # 2.5 لالتقاط الانحرافات الشديدة فقط
     df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * 2.5)
 
     # مؤشر ATR (متوسط المدى الحقيقي) لحساب المخاطرة والأهداف
@@ -158,7 +160,7 @@ def check_strategies_4h(symbol: str, df: pd.DataFrame):
     # الشروط: السعر يكسر الحد السفلي لبولينجر بقوة، مع RSI تحت 25 (تشبع بيعي حاد جداً)
     pierced_lower_bb = last['close'] < last['bb_lower']
     extreme_oversold = last['rsi_14'] < 25
-    reversal_candle = last['close'] > last['open'] # شمعة خضراء أغلقت إيجابية
+    reversal_candle = last['close'] > last['open']  # شمعة خضراء أغلقت إيجابية
 
     if pierced_lower_bb and extreme_oversold and reversal_candle:
         strategy_triggered = "Extreme Mean Reversion (Oversold Bounce)"
@@ -219,7 +221,7 @@ def execute_4h_trade(symbol: str, entry_price: float, direction: str, atr: float
 
 def main_bot_loop():
     """ محرك الفحص الرئيسي، يشتغل كل فترة للبحث عن صفقات جديدة """
-    # تهيئة اتصال Binance كـ Read-only في حال عدم وجود مفاتيح (يكفي لجلب الشموع)
+    # تهيئة اتصال Binance كـ Read-only في حال عدم وجود مفاتيح (يكفي لجلب الشموع التاريخية)
     try:
         client = Client(os.getenv("BINANCE_API_KEY", ""), os.getenv("BINANCE_API_SECRET", ""))
     except Exception as e:
@@ -243,20 +245,20 @@ def main_bot_loop():
                         'time', 'open', 'high', 'low', 'close', 'volume', 
                         'close_time', 'qav', 'num_trades', 'taker_base', 'taker_quote', 'ignore'
                     ])
-                    # تنظيف البيانات
+                    # تنظيف البيانات وتحويل الأنواع
                     for col in ['open', 'high', 'low', 'close', 'volume']:
                         df[col] = df[col].astype(float)
                     
-                    # معالجة وتحليل
+                    # معالجة المؤشرات وتدقيق الاستراتيجيات
                     df = calculate_indicators(df)
                     check_strategies_4h(symbol, df)
                     
-                    time.sleep(1) # حماية من حظر الـ API Rate Limit
+                    time.sleep(1)  # حماية من حظر الـ API Rate Limit
                     
                 except Exception as e:
                     logger.error(f"❌ [Engine Error] Failed to scan {symbol}: {e}")
                     
-        # في فريم 4 ساعات، الشموع تتغير ببطء. فحص كل 15 دقيقة أكثر من كافٍ.
+        # في فريم 4 ساعات، فحص كل 15 دقيقة ممتاز وموفر لموارد المعالج
         time.sleep(60 * 15)
 
 # =====================================================================
@@ -285,11 +287,32 @@ def control_bot():
     action = data.get("action")
     
     with trading_status_lock:
-        if action == "start": IS_TRADING_ENABLED = True
-        elif action == "stop": IS_TRADING_ENABLED = False
-        else: return jsonify({"error": "Invalid action"}), 400
+        if action == "start": 
+            IS_TRADING_ENABLED = True
+        elif action == "stop": 
+            IS_TRADING_ENABLED = False
+        else: 
+            return jsonify({"error": "Invalid action"}), 400
             
     return jsonify({"status": "success", "is_running": IS_TRADING_ENABLED}), 200
+
+# تمكين إرسال إشارات يدوية اختيارياً لاختبار التوصيل مع n8n فوراً
+@app.route('/api/v1/external-trigger', methods=['GET', 'POST'])
+@require_api_key
+def external_trigger():
+    symbol = request.args.get("symbol", "BTCUSDT")
+    direction = request.args.get("direction", "BUY")
+    
+    # حساب قيم افتراضية مبنية على آخر سعر
+    entry_price = 65000.0 if "BTC" in symbol else 3500.0
+    atr = entry_price * 0.02
+    
+    execute_4h_trade(symbol, entry_price, direction, atr, "Manual External Trigger (Test)")
+    return jsonify({
+        "status": "success", 
+        "message": f"Test signal triggered for {symbol}",
+        "entry_price": entry_price
+    }), 200
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -316,7 +339,7 @@ DASHBOARD_HTML = """
             <p>يستخدم استراتيجيات عالية الاحتمالية مبنية على السيولة والزخم المؤسسي.</p>
             
             <div style="margin: 20px 0;">
-                <span class="badge {{ '' if status.is_running else 'stopped' }}">
+                <span class="badge {% if not status.is_running %}stopped{% endif %}">
                     الحالة: {{ 'يعمل ويبحث عن صفقات' if status.is_running else 'متوقف مؤقتاً' }}
                 </span>
             </div>
@@ -359,6 +382,4 @@ if __name__ == '__main__':
     Thread(target=main_bot_loop, daemon=True).start()
     
     logger.info(f"🚀 Starting 4H Pro Bot on Port {PORT}...")
-    app.run(host='0.0.0.0', port=PORT)
-
-```
+    app.run(host='0.0.0.0', port=PORT) 
